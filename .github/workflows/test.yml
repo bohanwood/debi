@@ -1,0 +1,415 @@
+name: Test Debian Installation Script
+
+on:
+  push:
+    branches: [ master, main ]
+  pull_request:
+    branches: [ master, main ]
+  workflow_dispatch:
+
+jobs:
+  test-debi:
+    name: "Debian ${{ matrix.version }} | ${{ matrix.mirror }} | ethx:${{ matrix.ethx }} | user:${{ matrix.user }} | nc:${{ matrix.network_console }}"
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+
+    permissions:
+      contents: read
+
+    strategy:
+      fail-fast: false
+      matrix:
+        # Target Debian version to install
+        version: [10, 11, 12]
+        # Mirror configuration
+        mirror: ['default', 'ustc', 'cloudflare']
+        # Network interface naming
+        ethx: [true, false]
+        # User to create
+        user: ['root', 'debian']
+        # Enable network console for remote installation
+        network_console: [true]
+        
+        # Exclude combinations to keep matrix manageable (~12 tests)
+        exclude:
+          # Debian 10 - only test with default mirror and root user
+          - version: 10
+            mirror: 'ustc'
+          - version: 10
+            mirror: 'cloudflare'
+          - version: 10
+            user: 'debian'
+          - version: 10
+            ethx: false
+          
+          # For Debian 11 & 12, test key combinations
+          # Skip debian user with ustc (redundant)
+          - version: 11
+            mirror: 'ustc'
+            user: 'debian'
+          - version: 12
+            mirror: 'ustc'
+            user: 'debian'
+          
+          # Skip cloudflare without ethx (less common)
+          - mirror: 'cloudflare'
+            ethx: false
+          
+          # Skip default mirror without ethx for Debian 12
+          - version: 12
+            mirror: 'default'
+            ethx: false
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Cache APT packages
+        uses: actions/cache@v4
+        id: cache-apt
+        with:
+          path: ~/apt-cache
+          key: ${{ runner.os }}-apt-${{ hashFiles('.github/workflows/test.yml') }}
+          restore-keys: |
+            ${{ runner.os }}-apt-
+
+      - name: Restore APT cache
+        if: steps.cache-apt.outputs.cache-hit == 'true'
+        run: |
+          if [ -d ~/apt-cache ] && [ "$(ls -A ~/apt-cache 2>/dev/null)" ]; then
+            sudo cp ~/apt-cache/*.deb /var/cache/apt/archives/ 2>/dev/null || true
+          fi
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-kvm qemu-utils cloud-image-utils genisoimage expect sshpass
+
+      - name: Save APT cache
+        if: steps.cache-apt.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p ~/apt-cache
+          sudo cp /var/cache/apt/archives/*.deb ~/apt-cache/ 2>/dev/null || true
+          sudo chown -R $USER:$USER ~/apt-cache
+
+      - name: Check KVM availability
+        run: |
+          ls -la /dev/kvm
+          kvm-ok || true
+
+      - name: Cache Debian cloud image
+        id: cache-debian-image
+        uses: actions/cache@v4
+        with:
+          path: /tmp/debian-11-base.qcow2
+          key: debian-11-cloud-image-${{ hashFiles('.github/workflows/test.yml') }}
+          restore-keys: |
+            debian-11-cloud-image-
+
+      - name: Download Debian 11 cloud image
+        if: steps.cache-debian-image.outputs.cache-hit != 'true'
+        run: |
+          wget -O /tmp/debian-11-base.qcow2 "https://cloud.debian.org/images/cloud/bullseye/latest/debian-11-generic-amd64.qcow2"
+
+      - name: Create working disk image
+        run: |
+          qemu-img create -f qcow2 -F qcow2 -b /tmp/debian-11-base.qcow2 /tmp/test-disk.qcow2 20G
+          qemu-img resize /tmp/test-disk.qcow2 20G
+
+      - name: Create cloud-init configuration
+        run: |
+          mkdir -p /tmp/cloud-init
+
+          # meta-data
+          cat > /tmp/cloud-init/meta-data << 'EOF'
+          instance-id: test-debi-vm
+          local-hostname: test-debi
+          EOF
+
+          # user-data with root access
+          cat > /tmp/cloud-init/user-data << 'EOF'
+          #cloud-config
+          users:
+            - name: root
+              lock_passwd: false
+              plain_text_passwd: 'rootpass123'
+
+          ssh_pwauth: true
+          disable_root: false
+
+          packages:
+            - wget
+            - curl
+
+          runcmd:
+            - sed -i 's/^#PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config
+            - systemctl restart sshd
+          EOF
+
+          # Create ISO for cloud-init
+          genisoimage -output /tmp/cloud-init.iso \
+            -volid cidata -rational-rock -joliet \
+            /tmp/cloud-init/user-data /tmp/cloud-init/meta-data
+
+      - name: Start VM and wait for boot
+        run: |
+          # Start QEMU in background (daemonize mode doesn't support -nographic)
+          sudo qemu-system-x86_64 \
+            -machine type=pc,accel=kvm \
+            -cpu host \
+            -m 2048 \
+            -display none \
+            -drive file=/tmp/test-disk.qcow2,format=qcow2,if=virtio \
+            -cdrom /tmp/cloud-init.iso \
+            -net nic,model=virtio \
+            -net user,hostfwd=tcp::2222-:22 \
+            -serial file:/tmp/serial.log \
+            -monitor unix:/tmp/qemu-monitor.sock,server,nowait \
+            -daemonize
+
+          # Fix permissions on serial.log so it can be uploaded as artifact
+          sudo chmod 644 /tmp/serial.log
+
+          echo "Waiting for VM to boot and SSH to become available..."
+          for i in {1..60}; do
+            if sshpass -p 'rootpass123' ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p 2222 root@localhost 'echo SSH ready' 2>/dev/null; then
+              echo "SSH is ready!"
+              break
+            fi
+            echo "Attempt $i/60: Waiting for SSH..."
+            sleep 5
+          done
+
+          # Verify SSH is working
+          sshpass -p 'rootpass123' ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p 2222 root@localhost 'uname -a'
+
+      - name: Upload debi.sh to VM
+        run: |
+          sshpass -p 'rootpass123' scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -P 2222 \
+            ./debi.sh root@localhost:/root/debi.sh
+
+      - name: Make script executable
+        run: |
+          sshpass -p 'rootpass123' ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p 2222 root@localhost \
+            'chmod +x /root/debi.sh'
+
+      - name: Build debi.sh arguments from matrix parameters
+        id: build-args
+        run: |
+          # Start with version
+          ARGS="--version ${{ matrix.version }}"
+          
+          # Add mirror flag
+          if [ "${{ matrix.mirror }}" = "ustc" ]; then
+            ARGS="$ARGS --ustc"
+          elif [ "${{ matrix.mirror }}" = "cloudflare" ]; then
+            ARGS="$ARGS --cloudflare"
+          fi
+          # default mirror doesn't need a flag
+          
+          # Add ethx flag
+          if [ "${{ matrix.ethx }}" = "true" ]; then
+            ARGS="$ARGS --ethx"
+          fi
+          
+          # Add network-console flag
+          if [ "${{ matrix.network_console }}" = "true" ]; then
+            ARGS="$ARGS --network-console"
+          fi
+          
+          # Add user and password
+          ARGS="$ARGS --user ${{ matrix.user }} --password newpass123"
+          
+          echo "args=$ARGS" >> $GITHUB_OUTPUT
+          echo "Generated arguments: $ARGS"
+
+      - name: Run debi.sh with test arguments
+        run: |
+          echo "Running debi.sh with arguments: ${{ steps.build-args.outputs.args }}"
+
+          # Run the script with a pseudo-TTY to handle stty commands
+          # Use 'script' command to provide a PTY for non-interactive SSH
+          sshpass -p 'rootpass123' ssh -t -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p 2222 root@localhost \
+            "script -q -c 'cd /root && ./debi.sh ${{ steps.build-args.outputs.args }}' /tmp/debi-output.log; echo \"Script exit code: \$?\" >> /tmp/debi-output.log" || echo "Script execution finished with non-zero exit code, will validate via file checks"
+
+      - name: Download and check debi.sh output
+        run: |
+          sshpass -p 'rootpass123' scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -P 2222 \
+            root@localhost:/tmp/debi-output.log /tmp/debi-output.log || echo "Could not download output log"
+
+          if [ -f /tmp/debi-output.log ]; then
+            echo "=== debi.sh output ==="
+            cat /tmp/debi-output.log
+            echo "======================"
+          fi
+
+      - name: Verify installation preparation
+        run: |
+          echo "Checking if Debian installer files were downloaded..."
+
+          # Check if installer directory was created
+          sshpass -p 'rootpass123' ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p 2222 root@localhost \
+            'ls -la /boot/debian-* || echo "No installer directory found"'
+
+          # Check for installer components
+          sshpass -p 'rootpass123' ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p 2222 root@localhost \
+            'ls -lh /boot/debian-*/linux /boot/debian-*/initrd.gz 2>/dev/null || echo "Installer files not found"'
+
+          # Check GRUB configuration
+          sshpass -p 'rootpass123' ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p 2222 root@localhost \
+            'cat /etc/default/grub.d/zz-debi.cfg 2>/dev/null || echo "GRUB config not found"'
+
+          # Check if GRUB was updated with installer entry
+          sshpass -p 'rootpass123' ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p 2222 root@localhost \
+            'grep -A 5 "Debian Installer" /boot/grub/grub.cfg || echo "Debian Installer entry not found in GRUB"'
+
+      - name: Validate installation files exist
+        run: |
+          # Verify key files exist
+          sshpass -p 'rootpass123' ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p 2222 root@localhost \
+            'test -f /boot/debian-*/linux && test -f /boot/debian-*/initrd.gz && echo "Installation files verified!" || exit 1'
+
+          # Verify GRUB config was updated
+          sshpass -p 'rootpass123' ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p 2222 root@localhost \
+            'grep -q "Debian Installer" /boot/grub/grub.cfg && echo "GRUB config verified!" || exit 1'
+
+          echo "✓ Script execution completed successfully"
+          echo "✓ Installer files downloaded"
+          echo "✓ GRUB configuration updated"
+          echo "✓ System ready for reboot into Debian installer"
+
+      - name: Reboot into Debian installer
+        run: |
+          echo "Rebooting VM to start Debian installation..."
+          
+          # Trigger reboot - the system should boot into Debian installer
+          sshpass -p 'rootpass123' ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p 2222 root@localhost \
+            'reboot' 2>/dev/null || true
+          
+          echo "Reboot command sent. VM will now boot into Debian installer."
+          echo "The installation process will take several minutes..."
+
+      - name: Wait for Debian installation to complete
+        run: |
+          echo "Waiting for Debian installation to complete..."
+          echo "This typically takes 10-20 minutes depending on network speed and mirror."
+          echo "The installer will automatically reboot after completion."
+          
+          # Wait for the old system to go down
+          sleep 30
+          
+          # The installation process:
+          # 1. VM boots into Debian installer (netboot)
+          # 2. Installer runs unattended using preseed configuration
+          # 3. System installs packages from mirror
+          # 4. System reboots into newly installed Debian
+          
+          # We'll poll for SSH availability with the NEW password
+          # This indicates the new system has been installed and booted
+          
+          MAX_WAIT=1800  # 30 minutes maximum wait
+          POLL_INTERVAL=30
+          ELAPSED=0
+          
+          echo "Polling for new system availability (max wait: ${MAX_WAIT}s)..."
+          
+          while [ $ELAPSED -lt $MAX_WAIT ]; do
+            echo "Attempt at ${ELAPSED}s: Trying to connect with new credentials..."
+            
+            # Try to connect with the NEW password (set by debi.sh installation)
+            if sshpass -p 'newpass123' ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -p 2222 ${{ matrix.user }}@localhost 'echo "NEW SYSTEM CONNECTED!"' 2>/dev/null; then
+              echo "✓ Successfully connected to newly installed system!"
+              echo "✓ Installation completed successfully!"
+              exit 0
+            fi
+            
+            # Also check if old system is still responding (installation not started yet)
+            if sshpass -p 'rootpass123' ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 -p 2222 root@localhost 'echo "old system"' 2>/dev/null; then
+              echo "  Old system still responding - installation may not have started"
+            fi
+            
+            sleep $POLL_INTERVAL
+            ELAPSED=$((ELAPSED + POLL_INTERVAL))
+          done
+          
+          echo "✗ Timeout: Could not connect to new system after ${MAX_WAIT}s"
+          exit 1
+
+      - name: Verify new system installation
+        run: |
+          echo "Verifying the newly installed Debian system..."
+          
+          # Connect with new credentials and verify system
+          sshpass -p 'newpass123' ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p 2222 ${{ matrix.user }}@localhost << 'VERIFY_EOF'
+          echo "=== System Information ==="
+          uname -a
+          
+          echo ""
+          echo "=== OS Release ==="
+          cat /etc/os-release
+          
+          echo ""
+          echo "=== Disk Usage ==="
+          df -h
+          
+          echo ""
+          echo "=== Memory Info ==="
+          free -h
+          
+          echo ""
+          echo "=== Network Configuration ==="
+          ip addr show
+          
+          echo ""
+          echo "=== Hostname ==="
+          hostname
+          
+          echo ""
+          echo "✓ New Debian system is running successfully!"
+          VERIFY_EOF
+
+      - name: Collect debug information on failure
+        if: failure()
+        run: |
+          echo "=== Serial console log ==="
+          cat /tmp/serial.log || echo "No serial log available"
+
+          echo "=== Trying to connect with old credentials ==="
+          sshpass -p 'rootpass123' ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 -p 2222 root@localhost \
+            'journalctl -n 100' 2>/dev/null || echo "Could not connect with old credentials"
+
+          echo "=== Trying to connect with new credentials ==="
+          sshpass -p 'newpass123' ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 -p 2222 ${{ matrix.user }}@localhost \
+            'journalctl -n 100' 2>/dev/null || echo "Could not connect with new credentials"
+
+      - name: Shutdown VM
+        if: always()
+        run: |
+          # Try graceful shutdown with new credentials first (if new system is installed)
+          sshpass -p 'newpass123' ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 -p 2222 ${{ matrix.user }}@localhost \
+            'sudo poweroff' 2>/dev/null || true
+          
+          # Also try with old credentials (if still on old system)
+          sshpass -p 'rootpass123' ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 -p 2222 root@localhost \
+            'poweroff' 2>/dev/null || true
+
+          sleep 5
+
+          # Force kill QEMU if still running
+          sudo pkill qemu-system-x86_64 || true
+
+      - name: Upload logs as artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-logs-v${{ matrix.version }}-${{ matrix.mirror }}-ethx${{ matrix.ethx }}-${{ matrix.user }}-nc${{ matrix.network_console }}
+          path: |
+            /tmp/debi-output.log
+            /tmp/serial.log
+          if-no-files-found: warn
