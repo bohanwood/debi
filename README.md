@@ -161,6 +161,7 @@ sudo reboot
 | `--cloud-kernel` | *standard* | Use cloud-optimized kernel |
 | `--bpo-kernel` | *stable* | Use newer kernel from backports |
 | `--firmware` | *auto-detect* | Include non-free firmware for hardware |
+| `--hyperv-pci-hotfix` | *disabled* | Download the matching Debian kernel package, embed it in the installer initrd, and load `pci-hyperv.ko` during installer startup (useful for Azure NVMe/Hyper-V vPCI disk detection) |
 
 ### Advanced Options
 | Option | Default | Description |
@@ -292,6 +293,11 @@ sudo ./debi.sh --ip YOUR_IP/CIDR --gateway YOUR_GATEWAY
 **Need firmware for network card:**
 ```bash
 sudo ./debi.sh --firmware
+```
+
+**Azure NVMe disk not detected in installer (Hyper-V vPCI):**
+```bash
+sudo ./debi.sh --hyperv-pci-hotfix
 ```
 
 **Installation debugging:**
