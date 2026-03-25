@@ -171,6 +171,7 @@ sudo reboot
 | `--cloud-kernel` | *標準* | クラウド最適化カーネルを使用 |
 | `--bpo-kernel` | *stable* | backportsから新しいカーネルを使用 |
 | `--firmware` | *自動検出* | ハードウェア用のnon-freeファームウェアを含める |
+| `--hyperv-pci-hotfix` | *無効* | インストーラーのカーネルに一致する Debian kernel パッケージをダウンロードして initrd に組み込み、インストーラー起動初期に `pci-hyperv.ko` を読み込む（Azure NVMe / Hyper-V vPCI のディスク検出向け） |
 
 ### 詳細オプション
 
@@ -319,6 +320,12 @@ sudo ./debi.sh --ip YOUR_IP/CIDR --gateway YOUR_GATEWAY
 
 ```bash
 sudo ./debi.sh --firmware
+```
+
+**インストーラーで Azure NVMe ディスクを検出できない場合（Hyper-V vPCI）:**
+
+```bash
+sudo ./debi.sh --hyperv-pci-hotfix
 ```
 
 **インストールのデバッグ:**

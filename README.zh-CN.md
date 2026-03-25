@@ -173,6 +173,7 @@ sudo reboot
 | `--cloud-kernel` | *标准内核* | 使用为云环境优化的内核 |
 | `--bpo-kernel` | *稳定版内核* | 使用来自 backports 的较新内核 |
 | `--firmware` | *自动检测* | 为硬件安装 non-free 固件 |
+| `--hyperv-pci-hotfix` | *禁用* | 下载与安装器内核匹配的 Debian kernel 包，将其写入安装器 initrd，并在安装器启动早期加载 `pci-hyperv.ko`（适用于 Azure NVMe / Hyper-V vPCI 磁盘识别） |
 
 ### 高级选项
 
@@ -323,6 +324,12 @@ sudo ./debi.sh --ip YOUR_IP/CIDR --gateway YOUR_GATEWAY
 sudo ./debi.sh --firmware
 ```
 
+**Azure NVMe 磁盘在安装器中无法识别（Hyper-V vPCI）：**
+
+```bash
+sudo ./debi.sh --hyperv-pci-hotfix
+```
+
 **安装过程调试：**
 
 ```bash
@@ -354,4 +361,3 @@ sudo ./debi.sh --network-console --authorized-keys-url YOUR_KEYS_URL
 *作者 [@bohanyang](https://github.com/bohanyang) • [问题反馈](https://github.com/bohanyang/debi/issues) • [GitHub 仓库](https://github.com/bohanyang/debi)*
 
 </div>
-

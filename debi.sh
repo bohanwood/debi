@@ -89,6 +89,120 @@ download() {
     fi
 }
 
+find_kernel_package() {
+    local package_name filename
+
+    package_name="linux-image-$1"
+    filename=$(
+        gzip -dc "$2" | awk -v pkg="$package_name" '
+            BEGIN { RS = ""; FS = "\n" }
+            $1 == "Package: " pkg {
+                for (i = 1; i <= NF; i++) {
+                    if ($i ~ /^Filename: /) {
+                        sub(/^Filename: /, "", $i)
+                        print $i
+                        exit
+                    }
+                }
+            }
+        '
+    )
+    [ -n "$filename" ] && {
+        printf '%s\n' "$filename"
+        return 0
+    }
+
+    package_name="linux-image-$1-unsigned"
+    filename=$(
+        gzip -dc "$2" | awk -v pkg="$package_name" '
+            BEGIN { RS = ""; FS = "\n" }
+            $1 == "Package: " pkg {
+                for (i = 1; i <= NF; i++) {
+                    if ($i ~ /^Filename: /) {
+                        sub(/^Filename: /, "", $i)
+                        print $i
+                        exit
+                    }
+                }
+            }
+        '
+    )
+    [ -n "$filename" ] && printf '%s\n' "$filename"
+}
+
+find_installer_kernel_version() {
+    cpio -it -F "$1" 2> /dev/null |
+    sed -n 's#^lib/modules/\([^/]*\)/.*#\1#p' |
+    sort -u |
+    head -n 1
+}
+
+inject_hyperv_pci_hotfix() {
+    local initrd_file installer_kernel_version packages_url package_path tmpdir
+
+    initrd_file=$1
+    installer_kernel_version=$(find_installer_kernel_version "$initrd_file")
+    [ -n "$installer_kernel_version" ] ||
+    err "Could not determine the installer kernel version from $initrd_file"
+
+    tmpdir=$(mktemp -d)
+    packages_url="$mirror_protocol://$mirror_host$mirror_directory/dists/$suite/main/binary-$architecture/Packages.gz"
+    download "$packages_url" "$tmpdir/Packages.gz"
+
+    package_path=$(find_kernel_package "$installer_kernel_version" "$tmpdir/Packages.gz" || true)
+    [ -n "$package_path" ] || {
+        rm -rf "$tmpdir"
+        err "Could not find a Debian kernel package for installer kernel $installer_kernel_version"
+    }
+
+    mkdir -p \
+        "$tmpdir/hotfix/debi-hyperv-pci" \
+        "$tmpdir/hotfix/lib/debian-installer-startup.d"
+    download "$mirror_protocol://$mirror_host$mirror_directory/$package_path" "$tmpdir/hotfix/debi-hyperv-pci/kernel.deb"
+    chmod 0644 "$tmpdir/hotfix/debi-hyperv-pci/kernel.deb"
+
+    cat > "$tmpdir/hotfix/lib/debian-installer-startup.d/S25pci-hyperv-hotfix" << EOF
+#!/bin/sh
+set -eu
+
+kernel_version=$installer_kernel_version
+module_path="/lib/modules/\$kernel_version/kernel/drivers/pci/controller/pci-hyperv.ko"
+package_path=/debi-hyperv-pci/kernel.deb
+tmpdir=
+
+cleanup() {
+    [ -n "\$tmpdir" ] && rm -rf "\$tmpdir"
+}
+
+trap cleanup EXIT INT TERM
+
+modprobe pci_hyperv_intf 2> /dev/null || true
+
+if [ ! -f "\$module_path" ]; then
+    tmpdir=\$(mktemp -d /tmp/debi-hv-pci.XXXXXX) || exit 0
+    data_member=\$(ar t "\$package_path" 2> /dev/null | awk '/^data\\.tar\\./ { print; exit }')
+    ar p "\$package_path" "\$data_member" > "\$tmpdir/\$data_member" 2> /dev/null || exit 0
+    mkdir -p "\$tmpdir/extract" "\$(dirname "\$module_path")"
+    xzcat "\$tmpdir/\$data_member" | tar -xf - -C "\$tmpdir/extract" "./lib/modules/\$kernel_version/kernel/drivers/pci/controller/pci-hyperv.ko" 2> /dev/null || exit 0
+    cp -f "\$tmpdir/extract/lib/modules/\$kernel_version/kernel/drivers/pci/controller/pci-hyperv.ko" "\$module_path" || exit 0
+    chmod 0644 "\$module_path" || exit 0
+fi
+
+modprobe pci_hyperv 2> /dev/null || insmod "\$module_path" 2> /dev/null || true
+EOF
+    chmod 0755 "$tmpdir/hotfix/lib/debian-installer-startup.d/S25pci-hyperv-hotfix"
+
+    (
+        cd "$tmpdir/hotfix"
+        find debi-hyperv-pci lib | cpio -o -H newc -A -F "$initrd_file" > /dev/null 2>&1
+    ) || {
+        rm -rf "$tmpdir"
+        err 'Could not append the Hyper-V PCI hotfix to the installer initrd'
+    }
+
+    rm -rf "$tmpdir"
+}
+
 # Set "$mirror_proxy" with "$http/https/ftp_proxy"
 # only when it is empty and one of those is not empty
 set_mirror_proxy() {
@@ -268,6 +382,7 @@ hold=false
 power_off=false
 architecture=
 firmware=false
+hyperv_pci_hotfix=false
 force_efi_extra_removable=true
 grub_timeout=5
 dry_run=false
@@ -523,6 +638,9 @@ while [ $# -gt 0 ]; do
             ;;
         --firmware)
             firmware=true
+            ;;
+        --hyperv-pci-hotfix)
+            hyperv_pci_hotfix=true
             ;;
         --no-force-efi-extra-removable)
             force_efi_extra_removable=false
@@ -948,6 +1066,7 @@ save_grub_cfg='cat'
     [ "$firmware" = true ] && download "$firmware_url" firmware.cpio.gz
 
     gzip -d initrd.gz
+    [ "$hyperv_pci_hotfix" = true ] && inject_hyperv_pci_hotfix "$PWD/initrd"
     # cpio reads a list of file names from the standard input
     echo preseed.cfg | cpio -o -H newc -A -F initrd
 
